@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
+use arceos_posix_api as api;
 use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use core::ffi::{c_char, c_int, c_void};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -100,9 +100,14 @@ bitflags::bitflags! {
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -110,11 +115,11 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         SYS_EXIT_GROUP => {
             ax_println!("[SYS_EXIT_GROUP]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_EXIT => {
             ax_println!("[SYS_EXIT]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_MMAP => sys_mmap(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -131,16 +136,112 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
+/// Eagerly populates private mappings. Shared mappings and MAP_FIXED replacement
+/// need additional VM bookkeeping and are explicitly unsupported in this kernel.
+/// Executable mappings and PROT_NONE reservations are not implemented either.
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, PAGE_SIZE_4K};
+
+    syscall_body!(sys_mmap, {
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        let flags = MmapFlags::from_bits(flags).ok_or(LinuxError::EINVAL)?;
+        if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let private = flags.contains(MmapFlags::MAP_PRIVATE);
+        let shared = flags.contains(MmapFlags::MAP_SHARED);
+        if private == shared {
+            return Err(LinuxError::EINVAL);
+        }
+        if shared
+            || flags.contains(MmapFlags::MAP_FIXED)
+            || prot.is_empty()
+            || prot.contains(MmapProt::PROT_EXEC)
+        {
+            return Err(LinuxError::EOPNOTSUPP);
+        }
+        let size = length
+            .checked_add(PAGE_SIZE_4K - 1)
+            .ok_or(LinuxError::ENOMEM)?
+            & !(PAGE_SIZE_4K - 1);
+        (offset as usize)
+            .checked_add(size)
+            .filter(|end| *end <= isize::MAX as usize)
+            .ok_or(LinuxError::EOVERFLOW)?;
+
+        let file = if flags.contains(MmapFlags::MAP_ANONYMOUS) {
+            None
+        } else {
+            let file = api::get_file_like(fd)?;
+            // Verify both random-access support and read permission before mapping.
+            file.read_at(offset as u64, &mut [])?;
+            Some(file)
+        };
+
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        // Leave the null page unmapped. An address without MAP_FIXED is a hint.
+        let lower = aspace.base().as_usize().max(PAGE_SIZE_4K);
+        let limit = VirtAddrRange::new(VirtAddr::from(lower), aspace.end());
+        let hint = VirtAddr::from((addr as usize).max(lower)).align_down_4k();
+        let fits = |start: VirtAddr| {
+            start.as_usize() >= lower
+                && start
+                    .as_usize()
+                    .checked_add(size)
+                    .is_some_and(|end| end <= aspace.end().as_usize())
+        };
+        let start = aspace
+            .find_free_area(hint, size, limit)
+            .filter(|start| fits(*start))
+            .or_else(|| {
+                aspace
+                    .find_free_area(limit.start, size, limit)
+                    .filter(|start| fits(*start))
+            })
+            .ok_or(LinuxError::ENOMEM)?;
+        let mut permissions: MappingFlags = prot.into();
+        // RISC-V does not have a valid write-only leaf PTE.
+        if permissions.contains(MappingFlags::WRITE) {
+            permissions |= MappingFlags::READ;
+        }
+        aspace
+            .map_alloc(start, size, permissions, true)
+            .map_err(|_| LinuxError::ENOMEM)?;
+
+        let result = (|| -> axerrno::LinuxResult<()> {
+            if let Some(file) = file {
+                let mut buffer = [0u8; PAGE_SIZE_4K];
+                let mut copied = 0;
+                while copied < size {
+                    let n = file.read_at(
+                        offset as u64 + copied as u64,
+                        &mut buffer[..(size - copied).min(PAGE_SIZE_4K)],
+                    )?;
+                    if n == 0 {
+                        break; // Newly allocated pages already contain zeroes after EOF.
+                    }
+                    aspace.write(start + copied, &buffer[..n])?;
+                    copied += n;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Remove both the VM area and its owned frames on a failed read.
+            aspace.unmap(start, size)?;
+            return Err(error);
+        }
+        axhal::arch::flush_tlb(None);
+        Ok(start.as_usize())
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

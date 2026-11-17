@@ -37,6 +37,10 @@ impl FileLike for File {
         Ok(self.inner.lock().read(buf)?)
     }
 
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> LinuxResult<usize> {
+        Ok(self.inner.lock().read_at(offset, buf)?)
+    }
+
     fn write(&self, buf: &[u8]) -> LinuxResult<usize> {
         Ok(self.inner.lock().write(buf)?)
     }

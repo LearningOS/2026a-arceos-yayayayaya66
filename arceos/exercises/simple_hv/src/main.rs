@@ -15,6 +15,7 @@ mod regs;
 mod csrs;
 mod sbi;
 mod loader;
+mod emulation;
 
 use vcpu::VmCpuRegisters;
 use riscv::register::{scause, sstatus, stval};
@@ -50,10 +51,10 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
+    while !run_guest(&mut ctx, &uspace) {
     }
 
-    panic!("Hypervisor ok!");
+    ax_println!("Hypervisor ok!");
 }
 
 fn prepare_vm_pgtable(ept_root: PhysAddr) {
@@ -67,16 +68,15 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
     }
 }
 
-fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+fn run_guest(ctx: &mut VmCpuRegisters, uspace: &axmm::AddrSpace) -> bool {
     unsafe {
         _run_guest(ctx);
     }
 
-    vmexit_handler(ctx)
+    vmexit_handler(ctx, uspace)
 }
 
-#[allow(unreachable_code)]
-fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
+fn vmexit_handler(ctx: &mut VmCpuRegisters, uspace: &axmm::AddrSpace) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
@@ -95,23 +95,34 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         ax_println!("Shutdown vm normally!");
                         return true;
                     },
-                    _ => todo!(),
+                    _ => panic!("Unsupported SBI message: {:?}", msg),
                 }
             } else {
                 panic!("bad sbi message! ");
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
+            let instruction = read_guest_instruction(uspace, ctx.guest_regs.sepc);
+            assert!(
+                emulation::emulate_mhartid(instruction, &mut ctx.guest_regs.gprs),
+                "Bad instruction: {:#x} sepc: {:#x}",
+                instruction,
                 ctx.guest_regs.sepc
             );
+            // Only the successfully emulated 32-bit CSR read is consumed.
+            ctx.guest_regs.sepc += 4;
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
+            let instruction = read_guest_instruction(uspace, ctx.guest_regs.sepc);
+            let fault_addr = (riscv::register::htval::read() << 2) | (stval::read() & 3);
+            assert!(
+                emulation::emulate_mmio_load(instruction, fault_addr, &mut ctx.guest_regs.gprs),
+                "Unsupported guest load: instruction {:#x}, address {:#x}, sepc {:#x}",
+                instruction,
+                fault_addr,
                 ctx.guest_regs.sepc
             );
+            ctx.guest_regs.sepc += 4;
         },
         _ => {
             panic!(
@@ -123,6 +134,16 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
         }
     }
     false
+}
+
+/// The exercise guest keeps VS translation disabled, so sepc is also a GPA.
+/// Read through its owned address space instead of dereferencing a guest address.
+fn read_guest_instruction(uspace: &axmm::AddrSpace, pc: usize) -> u32 {
+    let mut bytes = [0u8; 4];
+    uspace
+        .read(pc.into(), &mut bytes)
+        .expect("Guest instruction is outside mapped memory");
+    u32::from_le_bytes(bytes)
 }
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {

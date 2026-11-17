@@ -1,18 +1,18 @@
 use core::fmt;
 
+use crate::backend::Backend;
+use crate::mapping_err_to_ax_err;
+use crate::paging_err_to_ax_err;
+use alloc::vec::Vec;
 use axerrno::{ax_err, AxError, AxResult};
 use axhal::{
     mem::phys_to_virt,
     paging::{MappingFlags, PageTable},
 };
 use memory_addr::{
-    is_aligned_4k, pa, MemoryAddr, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, PAGE_SIZE_4K,
+    is_aligned_4k, MemoryAddr, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, PAGE_SIZE_4K,
 };
 use memory_set::{MemoryArea, MemorySet};
-use crate::backend::Backend;
-use crate::paging_err_to_ax_err;
-use crate::mapping_err_to_ax_err;
-use alloc::vec::Vec;
 
 /// The virtual memory address space.
 pub struct AddrSpace {
@@ -115,17 +115,11 @@ impl AddrSpace {
         }
 
         let offset = start_vaddr.as_usize() - start_paddr.as_usize();
-        self.pt
-            .map_region(
-                start_vaddr,
-                |va| pa!(va.as_usize() - offset),
-                size,
-                flags,
-                false, // allow_huge
-                false, // flush_tlb_by_page
-            )
-            .map_err(paging_err_to_ax_err)?
-            .flush_all();
+        let area = MemoryArea::new(start_vaddr, size, flags, Backend::new_linear(offset));
+        self.areas
+            .map(area, &mut self.pt, false)
+            .map_err(mapping_err_to_ax_err)?;
+        axhal::arch::flush_tlb(None);
         Ok(())
     }
 
@@ -170,10 +164,9 @@ impl AddrSpace {
             return ax_err!(InvalidInput, "address not aligned");
         }
 
-        self.pt
-            .unmap_region(start, size, true)
-            .map_err(paging_err_to_ax_err)?
-            .ignore();
+        self.areas
+            .unmap(start, size, &mut self.pt)
+            .map_err(mapping_err_to_ax_err)?;
         Ok(())
     }
 

@@ -133,12 +133,16 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
+        self.lookup_mounted_fs(src_path, |src_fs, src_relative| {
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst_relative| {
+                if src_relative.is_empty() || dst_relative.is_empty() {
+                    return ax_err!(PermissionDenied); // cannot rename mount points
+                }
+                if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    return ax_err!(Unsupported); // cannot rename across filesystems
+                }
+                src_fs.root_dir().rename(src_relative, dst_relative)
+            })
         })
     }
 }
@@ -302,9 +306,19 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+    if old.is_empty() || new.is_empty() {
+        return ax_err!(NotFound);
     }
-    parent_node_of(None, old).rename(old, new)
+    let old = absolute_path(old)?;
+    let new = absolute_path(new)?;
+    // Let backends such as RAMFS replace the destination atomically.
+    // FAT validates the source but reports AlreadyExists instead of replacing;
+    // retain its existing remove-and-retry behavior only after that validation.
+    match ROOT_DIR.rename(&old, &new) {
+        Err(AxError::AlreadyExists) => {
+            remove_file(None, &new)?;
+            ROOT_DIR.rename(&old, &new)
+        }
+        result => result,
+    }
 }

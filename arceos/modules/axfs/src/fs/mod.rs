@@ -9,5 +9,10 @@ cfg_if::cfg_if! {
 #[cfg(feature = "devfs")]
 pub use axfs_devfs as devfs;
 
-#[cfg(feature = "ramfs")]
-pub use axfs_ramfs as ramfs;
+// Compile the local RAMFS source with this module's existing kernel mutex.
+// This keeps the teaching implementation in use without changing Cargo files.
+#[cfg(any(feature = "ramfs", feature = "procfs", feature = "sysfs"))]
+use axsync::Mutex;
+#[cfg(any(feature = "ramfs", feature = "procfs", feature = "sysfs"))]
+#[path = "../../../../axfs_ramfs/src/ramfs.rs"]
+pub mod ramfs;
